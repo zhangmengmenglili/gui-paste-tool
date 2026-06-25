@@ -223,6 +223,14 @@ class DefectPasteGUI:
         self.rotation_val = 0.0
         self.flip_h = False
         self.flip_v = False
+        # 弹性/拉伸/斜切形变
+        self.stretch_x = 1.0       # 横向拉伸/压缩 (相对uniform scale叠加)
+        self.stretch_y = 1.0       # 纵向拉伸/压缩
+        self.shear_x = 0.0         # 横向斜切角度 (度)
+        self.shear_y = 0.0         # 纵向斜切角度 (度)
+        self.elastic_strength = 0.0  # 弹性形变强度 0~1
+        self.elastic_seed = 0        # 弹性形变随机种子
+        self._elastic_cache = None   # (seed, shape, dx, dy)
         self.transformed_defect = None
         self.transformed_mask = None
         self.defect_pos = (0, 0)
@@ -353,6 +361,40 @@ class DefectPasteGUI:
                      state="readonly", width=14).pack(side=tk.LEFT, padx=2)
         self.blend_var.trace_add("write", lambda *a: setattr(self, 'blend_mode',
             'alpha' if 'alpha' in self.blend_var.get() else 'direct'))
+
+        # ---- 第5行: 形变参数（拉伸/压缩/斜切/弹性形变） ----
+        row5 = ttk.Frame(self.root, padding=3)
+        row5.pack(side=tk.TOP, fill=tk.X)
+
+        ttk.Label(row5, text="━━ 形变参数 ━━", foreground="gray").pack(side=tk.LEFT, padx=(10, 5))
+
+        ttk.Label(row5, text="横向拉伸:").pack(side=tk.LEFT, padx=(5, 2))
+        self.stretchx_var = tk.DoubleVar(value=self.stretch_x)
+        ttk.Scale(row5, from_=0.3, to=3.0, variable=self.stretchx_var,
+                  command=self._on_stretchx_change, length=80).pack(side=tk.LEFT, padx=2)
+
+        ttk.Label(row5, text="  纵向拉伸:").pack(side=tk.LEFT, padx=(5, 2))
+        self.stretchy_var = tk.DoubleVar(value=self.stretch_y)
+        ttk.Scale(row5, from_=0.3, to=3.0, variable=self.stretchy_var,
+                  command=self._on_stretchy_change, length=80).pack(side=tk.LEFT, padx=2)
+
+        ttk.Label(row5, text="  横向斜切:").pack(side=tk.LEFT, padx=(5, 2))
+        self.shearx_var = tk.DoubleVar(value=self.shear_x)
+        ttk.Scale(row5, from_=-60, to=60, variable=self.shearx_var,
+                  command=self._on_shearx_change, length=80).pack(side=tk.LEFT, padx=2)
+
+        ttk.Label(row5, text="  纵向斜切:").pack(side=tk.LEFT, padx=(5, 2))
+        self.sheary_var = tk.DoubleVar(value=self.shear_y)
+        ttk.Scale(row5, from_=-60, to=60, variable=self.sheary_var,
+                  command=self._on_sheary_change, length=80).pack(side=tk.LEFT, padx=2)
+
+        ttk.Label(row5, text="  弹性形变:").pack(side=tk.LEFT, padx=(5, 2))
+        self.elastic_var = tk.DoubleVar(value=self.elastic_strength)
+        ttk.Scale(row5, from_=0.0, to=1.0, variable=self.elastic_var,
+                  command=self._on_elastic_change, length=80).pack(side=tk.LEFT, padx=2)
+
+        ttk.Button(row5, text="🎲 换形态", command=self._reroll_elastic, width=9).pack(side=tk.LEFT, padx=4)
+        ttk.Button(row5, text="↺ 重置形变", command=self._reset_shape, width=10).pack(side=tk.LEFT, padx=2)
 
         # -- 主画布 --
         canvas_frame = ttk.Frame(self.root)
@@ -606,6 +648,7 @@ class DefectPasteGUI:
         cm_label = f"颜色匹配:{self.color_match:.0%}" if self.color_match > 0 else "颜色匹配:关"
         info = [
             f"视图: {self.view_scale:.0%} | 缺陷缩放: {self.scale_val:.2f}x | 旋转: {self.rotation_val:.0f}° | 翻转: H={self.flip_h} V={self.flip_v}",
+            f"拉伸: X={self.stretch_x:.2f} Y={self.stretch_y:.2f} | 斜切: X={self.shear_x:.0f}° Y={self.shear_y:.0f}° | 弹性: {self.elastic_strength:.2f}",
             f"模式: {self.blend_mode} | 羽化: {self.feather_size} | 边缘过渡: {self.alpha_strength:.2f} | {cm_label}",
             f"已贴: {len(self.pasted_defects)} 个 | 标签ID: {self.class_label.get()}",
             "左键:移动 | Shift+左键:旋转 | 滚轮:缩放视图 | Ctrl+滚轮:缩放缺陷 | 右键拖拽:平移 | 右键单击:放置",
@@ -749,6 +792,7 @@ class DefectPasteGUI:
         self.rotation_val = 0.0
         self.flip_h = False
         self.flip_v = False
+        self._reset_shape()
 
         # 初始位置: 背景图中心
         if self.bg_img_original is not None:
@@ -781,27 +825,89 @@ class DefectPasteGUI:
             d_img = cv2.flip(d_img, 0)
             d_mask = cv2.flip(d_mask, 0)
 
-        if self.rotation_val != 0:
-            h, w = d_img.shape[:2]
-            rot_mat = cv2.getRotationMatrix2D((w / 2, h / 2), self.rotation_val, 1.0)
-            d_img = cv2.warpAffine(d_img, rot_mat, (w, h),
-                                    flags=cv2.INTER_LINEAR,
-                                    borderMode=cv2.BORDER_CONSTANT,
-                                    borderValue=(0, 0, 0))
-            d_mask = cv2.warpAffine(d_mask, rot_mat, (w, h),
-                                     flags=cv2.INTER_LINEAR,
-                                     borderMode=cv2.BORDER_CONSTANT,
-                                     borderValue=0)
+        # ---- 弹性形变（在原始尺度上做，保持随机场稳定）----
+        d_img, d_mask = self._apply_elastic(d_img, d_mask)
 
-        if self.scale_val != 1.0:
-            h, w = d_img.shape[:2]
-            new_w = max(1, int(w * self.scale_val))
-            new_h = max(1, int(h * self.scale_val))
-            d_img = cv2.resize(d_img, (new_w, new_h), interpolation=cv2.INTER_LINEAR)
-            d_mask = cv2.resize(d_mask, (new_w, new_h), interpolation=cv2.INTER_LINEAR)
+        # ---- 几何形变：uniform缩放 + 非等比拉伸 + 斜切 + 旋转（合成一次仿射，画质更好）----
+        d_img, d_mask = self._apply_geometric(d_img, d_mask)
 
         self.transformed_defect = d_img
         self.transformed_mask = np.clip(d_mask, 0, 255).astype(np.uint8)
+
+    def _apply_elastic(self, img, mask):
+        """弹性形变：用高斯平滑的随机位移场对图像做 remap，得到自然的弹性扭曲。"""
+        if self.elastic_strength <= 0.001:
+            return img, mask
+
+        h, w = img.shape[:2]
+        # 缓存位移场，只有种子或尺寸变化时才重建（保证拖动时形态稳定）
+        cache = self._elastic_cache
+        if cache is None or cache[0] != self.elastic_seed or cache[1] != (h, w):
+            rng = np.random.RandomState(self.elastic_seed & 0x7FFFFFFF)
+            dx = (rng.rand(h, w).astype(np.float32) * 2 - 1)
+            dy = (rng.rand(h, w).astype(np.float32) * 2 - 1)
+            sigma = max(h, w) * 0.10
+            dx = cv2.GaussianBlur(dx, (0, 0), sigma)
+            dy = cv2.GaussianBlur(dy, (0, 0), sigma)
+            # 归一化到 [-1, 1]
+            dx /= (np.abs(dx).max() + 1e-6)
+            dy /= (np.abs(dy).max() + 1e-6)
+            self._elastic_cache = (self.elastic_seed, (h, w), dx, dy)
+        else:
+            dx, dy = cache[2], cache[3]
+
+        amp = self.elastic_strength * max(h, w) * 0.18
+        grid_x, grid_y = np.meshgrid(np.arange(w), np.arange(h))
+        map_x = (grid_x + dx * amp).astype(np.float32)
+        map_y = (grid_y + dy * amp).astype(np.float32)
+
+        img2 = cv2.remap(img, map_x, map_y, cv2.INTER_LINEAR,
+                         borderMode=cv2.BORDER_CONSTANT, borderValue=(0, 0, 0))
+        mask2 = cv2.remap(mask, map_x, map_y, cv2.INTER_LINEAR,
+                          borderMode=cv2.BORDER_CONSTANT, borderValue=0)
+        return img2, mask2
+
+    def _apply_geometric(self, img, mask):
+        """合成 缩放(等比+非等比) + 斜切 + 旋转 为单次仿射变换，并自动扩展画布避免裁剪。"""
+        h, w = img.shape[:2]
+        sx = self.scale_val * self.stretch_x
+        sy = self.scale_val * self.stretch_y
+        shx = np.tan(np.deg2rad(self.shear_x))
+        shy = np.tan(np.deg2rad(self.shear_y))
+        theta = np.deg2rad(self.rotation_val)
+        cos_t, sin_t = np.cos(theta), np.sin(theta)
+
+        # 线性部分: R @ Shear @ Scale
+        S = np.array([[sx, 0.0], [0.0, sy]], dtype=np.float64)
+        Sh = np.array([[1.0, shx], [shy, 1.0]], dtype=np.float64)
+        R = np.array([[cos_t, -sin_t], [sin_t, cos_t]], dtype=np.float64)
+        M2 = R @ Sh @ S
+
+        # 如果是恒等变换，直接返回
+        if (abs(sx - 1) < 1e-3 and abs(sy - 1) < 1e-3 and
+                abs(shx) < 1e-6 and abs(shy) < 1e-6 and abs(self.rotation_val) < 1e-3):
+            return img, mask
+
+        # 计算变换后包围盒
+        corners = np.array([[-w / 2, -h / 2], [w / 2, -h / 2],
+                            [w / 2, h / 2], [-w / 2, h / 2]], dtype=np.float64).T
+        new_corners = M2 @ corners
+        minx, miny = new_corners.min(axis=1)
+        maxx, maxy = new_corners.max(axis=1)
+        new_w = max(1, int(np.ceil(maxx - minx)))
+        new_h = max(1, int(np.ceil(maxy - miny)))
+
+        # 平移：使原中心映射到新画布中心
+        center_old = np.array([w / 2, h / 2], dtype=np.float64)
+        center_new = np.array([new_w / 2, new_h / 2], dtype=np.float64)
+        t = center_new - M2 @ center_old
+        M = np.hstack([M2, t.reshape(2, 1)])
+
+        img2 = cv2.warpAffine(img, M, (new_w, new_h), flags=cv2.INTER_LINEAR,
+                              borderMode=cv2.BORDER_CONSTANT, borderValue=(0, 0, 0))
+        mask2 = cv2.warpAffine(mask, M, (new_w, new_h), flags=cv2.INTER_LINEAR,
+                               borderMode=cv2.BORDER_CONSTANT, borderValue=0)
+        return img2, mask2
 
     def _place_defect_at(self):
         """将当前预览位置的缺陷粘贴到背景上。"""
@@ -893,8 +999,7 @@ class DefectPasteGUI:
             self.scale_val = 1.0
             self.flip_h = False
             self.flip_v = False
-            self._update_transformed()
-            self._update_display()
+            self._reset_shape()
         elif key == 'c' and self.mode == MODE_PLACE:
             # C = 切换颜色匹配 (0→0.5→1.0→0)
             self.color_match = {0: 0.5, 0.5: 1.0, 1.0: 0}.get(self.color_match, 0)
@@ -1021,6 +1126,61 @@ class DefectPasteGUI:
         self.color_match = float(val)
         self._update_display()
 
+    # ---- 形变参数回调 ----
+
+    def _on_stretchx_change(self, val):
+        self.stretch_x = float(val)
+        self._update_transformed()
+        self._update_display()
+
+    def _on_stretchy_change(self, val):
+        self.stretch_y = float(val)
+        self._update_transformed()
+        self._update_display()
+
+    def _on_shearx_change(self, val):
+        self.shear_x = float(val)
+        self._update_transformed()
+        self._update_display()
+
+    def _on_sheary_change(self, val):
+        self.shear_y = float(val)
+        self._update_transformed()
+        self._update_display()
+
+    def _on_elastic_change(self, val):
+        self.elastic_strength = float(val)
+        self._update_transformed()
+        self._update_display()
+
+    def _reroll_elastic(self):
+        """随机换一个弹性形态。"""
+        self.elastic_seed = random.randint(0, 1 << 30)
+        self._elastic_cache = None
+        if self.elastic_strength <= 0.001:
+            # 自动给一点强度，让效果可见
+            self.elastic_strength = 0.4
+            self.elastic_var.set(self.elastic_strength)
+        self._update_transformed()
+        self._update_display()
+        self.status_var.set(f"弹性形态已更换 (seed={self.elastic_seed}) | 强度 {self.elastic_strength:.2f}")
+
+    def _reset_shape(self):
+        """重置所有形变参数（拉伸/斜切/弹性），保留uniform缩放与旋转。"""
+        self.stretch_x = 1.0
+        self.stretch_y = 1.0
+        self.shear_x = 0.0
+        self.shear_y = 0.0
+        self.elastic_strength = 0.0
+        self.stretchx_var.set(1.0)
+        self.stretchy_var.set(1.0)
+        self.shearx_var.set(0.0)
+        self.sheary_var.set(0.0)
+        self.elastic_var.set(0.0)
+        self._update_transformed()
+        self._update_display()
+        self.status_var.set("形变参数已重置")
+
     def _show_help(self):
         help_text = """
 🖱 鼠标操作:
@@ -1054,6 +1214,13 @@ class DefectPasteGUI:
   Ctrl+Z      → 撤销上次粘贴
   H           → 显示此帮助
   ESC         → 退出
+
+🌀 形变参数 (第5行滑块, 让缺陷形态更多样):
+  横向/纵向拉伸 → 非等比拉伸或压缩 (X、Y独立)
+  横向/纵向斜切 → 斜着拉伸 (shear/错切变形)
+  弹性形变      → 自然的弹性扭曲 (波浪/不规则变形)
+  🎲 换形态     → 随机生成一个新的弹性形态
+  ↺ 重置形变    → 清空所有拉伸/斜切/弹性
 
 💡 提示:
   1. 先选好图和缺陷图目录,点"加载数据"
